@@ -1,0 +1,9 @@
+{
+  "dependencies": {
+    "@ai-sdk/langchain": "^2.0.181",
+    "@langchain/core": "^1.1.44",
+    "@langchain/langgraph": "^1.2.9",
+    "@langchain/ollama": "^1.2.7",
+    "ai": "^6.0.175"
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "code-runner.executorMap": {
+    "python": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"if (-not (Get-Process ollama -ErrorAction SilentlyContinue)) { Start-Process ollama -ArgumentList 'serve' -WindowStyle Hidden; Start-Sleep -Seconds 2 }; & 'C:\\Users\\kook1\\anaconda3\\python.exe' -X utf8 -u\""
+  }
+}
