@@ -15,8 +15,17 @@
  - failure modes: return error_message and ask user to try another url.
 
 ### classify_game_node
- - input: game_url, action_result
- - output: game_type
+ - input: game_url, browser_session_id, page_status
+ - output: game_type, genre, exist_game_type, classification_reason, game_type_confidence
+ - uses model? yes
+ - uses tools? take_screenshot_tool
+ - failure modes: failed_to_take_screenshot: {error_message}.
+
+ #### router_game_ready_node
+  - input: game_type, genre, exist_game_type, classification_reason, game_type_confidence
+  - router: if game_type, genre, exist_game_type, game_type_confidence != unknown and  classification_reason not contains unknown, go to make_test_plan_node, else go to classify_game_node.
+  - uses model? no
+  - uses tools? no
 
  ### make_test_plan_node
  - input: game_type, test_plan

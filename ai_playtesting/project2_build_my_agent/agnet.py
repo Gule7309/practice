@@ -1,6 +1,6 @@
 from typing import Annotated, Sequence, TypedDict, List, Literal, Optional, Any
 from dotenv import load_dotenv  
-from langchain_core.messages import BaseMessage, ToolMessage, SystemMessage
+from langchain_core.messages import BaseMessage, ToolMessage, SystemMessage, HumanMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.tools import tool
 from langgraph.graph.message import add_messages
@@ -10,6 +10,10 @@ import uuid
 import json
 import atexit
 import datetime
+import base64
+import os
+import time
+from pydantic import BaseModel, Field
 from playwright.sync_api import sync_playwright
 from langgraph.checkpoint.sqlite import SqliteSaver
 
@@ -29,8 +33,18 @@ class BrowserManager:
             if not self.playwright:
                 self.playwright = sync_playwright().start()
 
-            # Launch headful Chromium browser by default
-            browser = self.playwright.chromium.launch(headless=False)
+            # Launch browser with GPU bypass flags to ensure WebGL/Canvas games load correctly
+            try:
+                browser = self.playwright.chromium.launch(
+                    headless=False,
+                    channel="chrome",
+                    args=["--ignore-gpu-blocklist", "--enable-webgl", "--no-sandbox"]
+                )
+            except Exception:
+                browser = self.playwright.chromium.launch(
+                    headless=False,
+                    args=["--ignore-gpu-blocklist", "--enable-webgl", "--no-sandbox"]
+                )
             context = browser.new_context()
             page = context.new_page()
 
@@ -126,50 +140,21 @@ atexit.register(browser_manager.close_all)
 #     evidence: list[str]
 
 
+from langchain_core.runnables import RunnableConfig
+
 class PlaytestState(TypedDict, total=False):
     run_id: str
     game_url: str
     browser_session_id: str
     page_status: str
-
-    # game_type: str
-    # game_type_confidence: float
-    # exist_game_type: bool
-
-    # test_plan: list[dict]
-    # current_goal: dict
-
-    # step: int
-    # max_steps: int
-
-    # observation_before: Observation
-    # observation_after: Observation
-
-    # current_action: Action
-    # action_valid: bool
-    # action_result: ActionResult
-
-    # verification_result: VerificationResult
-    # bug_candidate: BugCandidate
-
-    # recovery_attempt: int
-    # fatal_error: bool
-
-    # next_route: Literal[
-    #     "continue",
-    #     "revise_action",
-    #     "recover",
-    #     "report_now",
-    #     "end"
-    # ]
-
-    # stop_reason: Optional[str]
-    # report_mode: Optional[Literal["normal_end", "early_bug_report"]]
-
-    # trace: list[dict]
-    # final_report: str
-    # report_valid: bool
-    # exist_game_type: bool
+    screenshot_path: str
+    game_type: str
+    genre: str
+    classification_reason: List[str]
+    game_type_confidence: float
+    exist_game_type: bool
+    retry_count: int
+    test_plan: List[str]
 
 @tool
 def open_game_tool(game_url: str) -> str:
@@ -180,8 +165,39 @@ def open_game_tool(game_url: str) -> str:
         "page_status": status
     })
 
+@tool
+def take_screenshot_tool(browser_session_id: str) -> str:
+    """Take a screenshot of the current page associated with the browser_session_id.
+    
+    Returns the saved screenshot file path.
+    """
+    try:
+        # 1. 從全域的 browser_manager 取得對應的 Page 物件
+        page = browser_manager.get_page(browser_session_id)
+        
+        # Wait for page/network stability to avoid loading race conditions
+        try:
+            page.wait_for_load_state("networkidle", timeout=3000)
+        except Exception:
+            pass
+
+        # 2. 建立儲存截圖的資料夾 (例如專案目錄下的 screenshots)
+        os.makedirs("screenshots", exist_ok=True)
+        
+        # 3. 產生不重複的檔名：用 session_id 搭配時間戳記
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        screenshot_path = f"screenshots/{browser_session_id}_{timestamp}.png"
+        
+        # 4. 呼叫 Playwright 截圖 API，它會自動把畫面寫入硬碟
+        page.screenshot(path=screenshot_path)
+        
+        # 5. 回傳檔案路徑，供後續節點（例如 LLM 視覺節點）讀取
+        return screenshot_path
+    except Exception as e:
+        return f"failed_to_take_screenshot: {e}"
 
 def open_game_node(state: PlaytestState) -> PlaytestState:
+    """This node is used to open the game in the browser and return the session info."""
     try:
         # Invoke the open_game_tool to get the browser session
         result_str = open_game_tool.invoke({"game_url": state["game_url"]})
@@ -196,6 +212,200 @@ def open_game_node(state: PlaytestState) -> PlaytestState:
             "page_status": f"error: {e}"
         }
 
+class GameClassification(BaseModel):
+    game_type: str = Field(description="The type of the game. Choose from: 'canvas' (uses HTML5 canvas/WebGL), 'html_ui' (standard HTML elements/buttons), 'text' (text adventure/terminal-like), or 'unknown'.")
+    genre: str = Field(description="The genre of the game, e.g. RPG, platformer, puzzle, action, or 'unknown'.")
+    reasons: List[str] = Field(description="A list of specific visual reasons or evidence seen on screen that support this classification (e.g. 'found health bar', 'found d-pad', 'found canvas element', 'found menu buttons').")
+
+def check_game_exists(target_game_type: str, target_genre: str, current_thread_id: Optional[str] = None) -> bool:
+    """Check if the combination of game_type and genre has occurred in any previous checkpoints in the database (excluding current thread)."""
+    if target_game_type == "unknown" or target_genre == "unknown":
+        return False
+    try:
+        # Query checkpoints from the global memory saver
+        for checkpoint_tuple in memory.list(None):
+            thread_id = checkpoint_tuple.config.get("configurable", {}).get("thread_id")
+            if current_thread_id and thread_id == current_thread_id:
+                continue
+            vals = checkpoint_tuple.checkpoint.get("channel_values", {})
+            if (vals.get("game_type") == target_game_type and 
+                vals.get("genre") == target_genre):
+                return True
+    except Exception as e:
+        print(f"Error checking previous checkpoints: {e}")
+    return False
+
+def classify_game_node(state: PlaytestState, config: RunnableConfig) -> PlaytestState:
+    """This node is used to classify the game type using the multimodal LLM (Gemini 2.5 Flash)."""
+    try:
+        # 0. Wait 5 seconds for initial page stabilization
+        try:
+            page = browser_manager.get_page(state["browser_session_id"])
+            page.wait_for_timeout(5000)
+        except Exception:
+            pass
+
+        # 1. Take a screenshot using the tool (returns raw file path string)
+        screenshot_path = take_screenshot_tool.invoke({"browser_session_id": state["browser_session_id"]})
+        
+        if screenshot_path.startswith("failed_to_take_screenshot"):
+            return {
+                "screenshot_path": screenshot_path,
+                "game_type": "unknown",
+                "genre": "unknown",
+                "classification_reason": [],
+                "game_type_confidence": 0.0,
+                "exist_game_type": False
+            }
+
+        # 2. Read the image and base64-encode it
+        with open(screenshot_path, "rb") as image_file:
+            image_data = base64.b64encode(image_file.read()).decode("utf-8")
+
+        # 3. Construct a multimodal message instructing loading rules
+        message = HumanMessage(
+            content=[
+                {
+                    "type": "text",
+                    "text": (
+                        "Analyze this screenshot of the game.\n"
+                        "1. Check if the game has finished loading and is in a playable/interactive state.\n"
+                        "2. If the screenshot shows a loading screen (e.g. 'Loading...', progress bar), a completely black/blank/empty screen, a generic loading spinner, or is otherwise not fully loaded:\n"
+                        "   - game_type MUST be 'unknown'\n"
+                        "   - genre MUST be 'unknown'\n"
+                        "   - reasons MUST list the loading indicators (e.g., 'found loading screen', 'black/empty area').\n"
+                        "3. If the game is fully loaded and playable:\n"
+                        "   - game_type: classify as 'canvas' (uses HTML5 canvas/WebGL), 'html_ui' (standard HTML elements/buttons), or 'text' (text adventure/terminal-like).\n"
+                        "   - genre: classify as RPG, platformer, puzzle, action, etc.\n"
+                        "   - reasons: list specific visual elements of the game (e.g., 'health bar', 'joystick', 'start button', 'rendered game environment'). Do NOT list loading/empty screens as reasons for a valid classification."
+                    )
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{image_data}"},
+                },
+            ]
+        )
+
+        # 4. Use structured output to get the Pydantic schema result
+        structured_llm = model_1.with_structured_output(GameClassification)
+        classification = structured_llm.invoke([message])
+
+        # Force unknown if loading indicators are in reasons
+        reasons = classification.reasons or []
+        is_loading_detected = (
+            classification.game_type == "unknown" or
+            classification.genre == "unknown" or
+            any("loading" in r.lower() for r in reasons) or
+            any("black" in r.lower() for r in reasons) or
+            any("empty" in r.lower() for r in reasons)
+        )
+
+        if is_loading_detected:
+            g_type = "unknown"
+            genre = "unknown"
+            confidence = 0.0
+            is_existing = False
+        else:
+            g_type = classification.game_type
+            genre = classification.genre
+            # Calculate confidence score programmatically based on the reasons list:
+            # - Reasons empty -> confidence = 0.3
+            # - Reasons count > 3 -> confidence = 0.9
+            # - Reasons count between 1 and 3 -> confidence = 0.6
+            if not reasons:
+                confidence = 0.3
+            elif len(reasons) > 3:
+                confidence = 0.9
+            else:
+                confidence = 0.6
+
+            # Determine if the classified game_type and genre combination already exists in persistence
+            thread_id = config.get("configurable", {}).get("thread_id")
+            is_existing = check_game_exists(g_type, genre, thread_id)
+
+        return {
+            "screenshot_path": screenshot_path,
+            "game_type": g_type,
+            "genre": genre,
+            "classification_reason": reasons,
+            "game_type_confidence": confidence,
+            "exist_game_type": is_existing
+        }
+    except Exception as e:
+        return {
+            "screenshot_path": f"error: {e}",
+            "game_type": "unknown",
+            "genre": "unknown",
+            "classification_reason": [],
+            "game_type_confidence": 0.0,
+            "exist_game_type": False
+        }
+
+def wait_node(state: PlaytestState) -> PlaytestState:
+    """This node pauses execution to allow the game elements to load, and increments retry count."""
+    current_retry = state.get("retry_count", 0)
+    print(f"\n[Node Executed] wait_node (Retry Count: {current_retry + 1}/3)")
+    print("Waiting 5 seconds for the game to load...")
+    time.sleep(5)
+    return {"retry_count": current_retry + 1}
+
+class TestPlan(BaseModel):
+    steps: List[str] = Field(description="A sequential list of playtesting objectives or actions (e.g. 'Click the play button', 'Press Arrow Keys to move', 'Observe collision effects').")
+
+def make_test_plan_node(state: PlaytestState) -> PlaytestState:
+    """Generates a playtesting plan based on the game type and genre using Gemini."""
+    try:
+        # Prompt model_2 (Gemini Pro) to generate a detailed, structured playtesting plan
+        prompt = (
+            f"You are a professional QA playtesting assistant.\n"
+            f"The game URL is: {state.get('game_url')}\n"
+            f"The game has been classified as:\n"
+            f"  - Game Type: {state.get('game_type')}\n"
+            f"  - Genre: {state.get('genre')}\n\n"
+            f"Based on the game type and genre, generate a step-by-step playtesting plan containing 3 to 5 clear objectives or actions to verify the game."
+        )
+        
+        structured_llm = model_2.with_structured_output(TestPlan)
+        plan = structured_llm.invoke([HumanMessage(content=prompt)])
+        
+        print("\n[Node Executed] make_test_plan_node")
+        print("Generated Test Plan:")
+        for idx, step in enumerate(plan.steps, 1):
+            print(f"  {idx}. {step}")
+        
+        return {"test_plan": plan.steps}
+    except Exception as e:
+        print(f"Error in make_test_plan_node: {e}")
+        return {"test_plan": ["Failed to generate test plan."]}
+
+def route_game_ready(state: PlaytestState) -> str:
+    """Routes the graph based on whether the game is fully loaded or still loading."""
+    game_type = state.get("game_type", "unknown")
+    genre = state.get("genre", "unknown")
+    reasons = state.get("classification_reason", [])
+    retry_count = state.get("retry_count", 0)
+
+    # Consider it loading if type/genre is unknown, or if reasons specifically mention loading/empty
+    is_loading = (
+        game_type == "unknown" or 
+        genre == "unknown" or 
+        any("loading" in r.lower() for r in reasons) or
+        any("black" in r.lower() for r in reasons) or
+        any("empty" in r.lower() for r in reasons)
+    )
+
+    if is_loading:
+        if retry_count < 3:
+            print("Game is still loading or unknown. Routing to wait...")
+            return "wait"
+        else:
+            print("Maximum retry limit reached (3). Proceeding to END...")
+            return "end"
+    else:
+        print("Game is ready and classified successfully. Routing to make_test_plan...")
+        return "make_test_plan"
+
 tools = [open_game_tool]
 
 model_1 = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0).bind_tools(tools)
@@ -204,9 +414,29 @@ model_2 = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.2).bind_t
 graph = StateGraph(PlaytestState)
 
 graph.add_node("open_game", open_game_node)
+graph.add_node("classify_game", classify_game_node)
+graph.add_node("wait", wait_node)
+graph.add_node("make_test_plan", make_test_plan_node)
 
 graph.set_entry_point("open_game")
-graph.add_edge("open_game", END)
+graph.add_edge("open_game", "classify_game")
+
+# Route conditionally based on game readiness check
+graph.add_conditional_edges(
+    "classify_game",
+    route_game_ready,
+    {
+        "wait": "wait",
+        "make_test_plan": "make_test_plan",
+        "end": END
+    }
+)
+
+# Loop back to classify_game after waiting
+graph.add_edge("wait", "classify_game")
+
+# Once test plan is created, end the flow
+graph.add_edge("make_test_plan", END)
 
 # SQLite Checkpointer for persistent state saving
 memory_context = SqliteSaver.from_conn_string("state_db.sqlite")
