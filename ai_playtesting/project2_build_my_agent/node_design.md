@@ -16,7 +16,7 @@
 
 ### classify_game_node
  - input: game_url, browser_session_id, page_status
- - output: game_type, genre, exist_game_type, classification_reason, game_type_confidence
+ - output: game_type, genre, exist_game_type, classification_reason, game_type_confidence, screenshot_path
  - uses model? yes
  - uses tools? take_screenshot_tool
  - failure modes: failed_to_take_screenshot: {error_message}.
@@ -28,8 +28,11 @@
   - uses tools? no
 
  ### make_test_plan_node
- - input: game_type, test_plan
- - output: test_plan
+- input: game_url, game_type, genre, exist_game_type, classification_reason, game_type_confidence, screenshot_path
+  - output: test_plan, plan_reasoning, critical_checkpoints
+  - uses model? yes
+  - uses tools? no
+  - failure modes: failed_to_make_test_plan: {error_message}.
 
  ### validate_test_plan_node
  - input: game_type, test_plan

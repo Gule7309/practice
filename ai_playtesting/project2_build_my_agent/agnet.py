@@ -154,7 +154,11 @@ class PlaytestState(TypedDict, total=False):
     game_type_confidence: float
     exist_game_type: bool
     retry_count: int
+
     test_plan: List[str]
+    plan_reasoning: str
+    critical_checkpoints: List[str]
+    current_goal: dict
 
 @tool
 def open_game_tool(game_url: str) -> str:
@@ -342,42 +346,72 @@ def classify_game_node(state: PlaytestState, config: RunnableConfig) -> Playtest
             "exist_game_type": False
         }
 
-def wait_node(state: PlaytestState) -> PlaytestState:
-    """This node pauses execution to allow the game elements to load, and increments retry count."""
-    current_retry = state.get("retry_count", 0)
-    print(f"\n[Node Executed] wait_node (Retry Count: {current_retry + 1}/3)")
-    print("Waiting 5 seconds for the game to load...")
-    time.sleep(5)
-    return {"retry_count": current_retry + 1}
-
 class TestPlan(BaseModel):
-    steps: List[str] = Field(description="A sequential list of playtesting objectives or actions (e.g. 'Click the play button', 'Press Arrow Keys to move', 'Observe collision effects').")
+    steps: List[str] = Field(description="Sequential list of actions to perform.")
+    reasoning: str = Field(description="Logic behind this test plan based on game type.")
+    checkpoints: List[str] = Field(description="Key states to verify during execution.")
 
 def make_test_plan_node(state: PlaytestState) -> PlaytestState:
     """Generates a playtesting plan based on the game type and genre using Gemini."""
     try:
-        # Prompt model_2 (Gemini Pro) to generate a detailed, structured playtesting plan
-        prompt = (
+        # Read the screenshot if exists and base64-encode it for multimodal input
+        image_data = None
+        screenshot_path = state.get("screenshot_path")
+        if screenshot_path and os.path.exists(screenshot_path):
+            try:
+                with open(screenshot_path, "rb") as image_file:
+                    image_data = base64.b64encode(image_file.read()).decode("utf-8")
+            except Exception as e:
+                print(f"Warning: failed to read screenshot for test plan: {e}")
+
+        # Construct a comprehensive prompt using all the required inputs
+        prompt_text = (
             f"You are a professional QA playtesting assistant.\n"
             f"The game URL is: {state.get('game_url')}\n"
-            f"The game has been classified as:\n"
+            f"The game classification details are:\n"
             f"  - Game Type: {state.get('game_type')}\n"
-            f"  - Genre: {state.get('genre')}\n\n"
-            f"Based on the game type and genre, generate a step-by-step playtesting plan containing 3 to 5 clear objectives or actions to verify the game."
+            f"  - Genre: {state.get('genre')}\n"
+            f"  - Previously seen: {state.get('exist_game_type')}\n"
+            f"  - Classification confidence: {state.get('game_type_confidence')}\n"
+            f"  - Visual evidence: {', '.join(state.get('classification_reason', []))}\n\n"
+            f"Based on the game type, genre, and the screenshot, generate a TestPlan detailing:\n"
+            f"1. A sequential list of playtesting steps/actions to perform.\n"
+            f"2. The QA reasoning/logic behind this plan.\n"
+            f"3. Key checkpoints/states to verify during execution to ensure the game works properly."
         )
-        
+
+        content = [{"type": "text", "text": prompt_text}]
+        if image_data:
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{image_data}"}
+            })
+
+        message = HumanMessage(content=content)
         structured_llm = model_2.with_structured_output(TestPlan)
-        plan = structured_llm.invoke([HumanMessage(content=prompt)])
+        plan = structured_llm.invoke([message])
         
         print("\n[Node Executed] make_test_plan_node")
-        print("Generated Test Plan:")
+        print(f"Generated Test Plan Reasoning: {plan.reasoning}")
+        print("Generated Test Plan Steps:")
         for idx, step in enumerate(plan.steps, 1):
             print(f"  {idx}. {step}")
+        print("Generated Checkpoints to Verify:")
+        for idx, checkpoint in enumerate(plan.checkpoints, 1):
+            print(f"  {idx}. {checkpoint}")
         
-        return {"test_plan": plan.steps}
+        return {
+            "test_plan": plan.steps,
+            "plan_reasoning": plan.reasoning,
+            "critical_checkpoints": plan.checkpoints
+        }
     except Exception as e:
         print(f"Error in make_test_plan_node: {e}")
-        return {"test_plan": ["Failed to generate test plan."]}
+        return {
+            "test_plan": [],
+            "plan_reasoning": f"failed_to_make_test_plan: {e}",
+            "critical_checkpoints": []
+        }
 
 def route_game_ready(state: PlaytestState) -> str:
     """Routes the graph based on whether the game is fully loaded or still loading."""
@@ -415,7 +449,6 @@ graph = StateGraph(PlaytestState)
 
 graph.add_node("open_game", open_game_node)
 graph.add_node("classify_game", classify_game_node)
-graph.add_node("wait", wait_node)
 graph.add_node("make_test_plan", make_test_plan_node)
 
 graph.set_entry_point("open_game")
