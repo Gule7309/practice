@@ -28,19 +28,31 @@
   - uses tools? no
 
  ### make_test_plan_node
-- input: game_url, game_type, genre, exist_game_type, classification_reason, game_type_confidence, screenshot_path
+- input: game_url, game_type, genre, exist_game_type, classification_reason, game_type_confidence, screenshot_path, error_message
   - output: test_plan, plan_reasoning, critical_checkpoints
   - uses model? yes
   - uses tools? no
   - failure modes: failed_to_make_test_plan: {error_message}.
 
  ### validate_test_plan_node
- - input: game_type, test_plan
- - output: test_plan
+ - input: test_plan, plan_reasoning, critical_checkpoints
+ - output: if_valid_test_plan, error_message
+ - uses model? yes
+ - uses tools? no
+ - failure modes: failed_to_validate_test_plan: {error_message}.
+ 
+#### router_test_plan_ready_node
+ - input: if_valid_test_plan, error_message
+ - router: if if_valid_test_plan is True, go to observe_before_node, else go to make_test_plan_node and append error_message to test_plan.
+ - uses model? no
+ - uses tools? no
 
  ### observe_before_node
- - input: game_type, test_plan
- - output: test_plan
+ - input: browser_session_id, current_action, last_action_result
+ - output: page_status, observation_before
+ - uses model? yes
+ - uses tools? no
+ - failure modes: failed_to_validate_test_plan: {error_message}.
 
  ### select_test_goal_node
  - input: game_type, test_plan, error_message
