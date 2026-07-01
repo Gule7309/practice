@@ -19,7 +19,6 @@ The Supervisor should not directly play the game, classify the game, verify bugs
 - state.WorkingMemory.last_play_step
 - state.WorkingMemory.last_play_review
 - state.WorkingMemory.recovery_attempts
-- state.WorkingMemory.last_review_result
 - state.Artifacts.trace_ids
 
 #### Output:
@@ -218,7 +217,7 @@ The Planner Agent does not directly interact with the game, does not choose low-
 - state.RunContext.run_id
 - state.RunContext.game_url
 - state.TestPlan
-- state.WorkingMemory.last_review_result (for replan)
+- state.WorkingMemory.last_play_review (for replan)
 
 #### Output:
 The Planner outputs a structured test_plan_result:
@@ -483,3 +482,386 @@ If the Game Analyst cannot classify the game confidently, it should not fail the
 }
 
 The system should continue to Planner using the fallback profile.
+
+### Agent: Critic Agent
+
+#### Responsibility:
+The Critic Agent is responsible for reviewing the result of a playtesting step.
+
+It reads the latest last_play_step produced by the Playtester Agent, compares the action and expected result against the before/after observations, and produces a structured review.
+
+The Critic Agent does not operate the browser, does not choose the next action, and does not write the final report. Its job is to evaluate evidence and recommend what should happen next.
+
+#### Input:
+- state.RunContext.run_id
+- state.RunContext.game_url
+- state.RunContext.status
+- state.TestPlan
+- state.WorkingMemory.last_play_step
+- state.Artifacts.screenshots (before and after)
+
+#### Output:
+The Critic outputs a structured review_result:
+
+{
+  "review_id": "review_003",
+  "step": 3,
+  "passed": false,
+  "failure_type": "no_screen_change",
+  "confidence": 0.82,
+  "evidence_summary": "The Playtester pressed ArrowRight to test movement, but the before and after screenshots appear visually unchanged. No console errors were found.",
+  "expected_result": "The character or scene should move after pressing ArrowRight.",
+  "actual_result": "No visible movement or state change was detected.",
+  "likely_cause": "environment_or_focus_issue",
+  "bug_candidate": {
+    "is_bug": false,
+    "severity": "low",
+    "title": null,
+    "description": null,
+    "evidence": []
+  },
+  "recommendation": "recover",
+  "recommendation_reason": "The failure may be caused by the canvas not receiving keyboard focus. Recovery should try clicking the canvas center before retrying."
+}
+
+#### Bug Candidate Guidelines
+
+The Critic should only create a bug candidate when there is enough evidence.
+
+Good bug candidate:
+
+{
+  "is_bug": true,
+  "severity": "high",
+  "title": "Game crashes after pressing Start",
+  "description": "After clicking the Start button, the page becomes black and a JavaScript error appears in the console.",
+  "evidence": [
+    "before_screenshot_path",
+    "after_screenshot_path",
+    "console_error_summary"
+  ]
+}
+
+Weak bug candidate that should not be treated as confirmed:
+
+{
+  "is_bug": false,
+  "severity": "low",
+  "title": null,
+  "description": null,
+  "evidence": []
+}
+
+Example weak evidence:
+
+The game did not respond to ArrowRight once, but the canvas may not have been focused.
+
+In that case, the Critic should recommend recover or retry, not report_now.
+
+#### Does Not Do
+
+The Critic Agent must not:
+
+click, press keys, or operate the browser
+choose the next low-level action
+revise the test plan directly
+recover the environment directly
+write the final report
+update long-term memory directly
+label weak evidence as a confirmed game bug
+ignore possible agent or environment failure
+
+#### Review Guidelines
+
+The Critic should evaluate a play step using the following questions:
+
+1. What was the selected goal?
+2. What action did the Playtester take?
+3. What was expected to happen?
+4. What actually happened?
+5. Did the action execute successfully?
+6. Did the screen, DOM, console, or game state change?
+7. Is the result enough to mark the goal as passed?
+8. If not passed, what is the most likely cause?
+9. Is this a possible game bug or an agent/environment issue?
+10. What should the Supervisor do next?
+
+### Agent: Recovery Agent
+
+#### Responsibility:
+The Recovery Agent is responsible for attempting to recover the browser game environment when a playtesting step fails due to a likely environment, focus, loading, or interaction issue.
+
+It receives the latest Critic review, the latest play step, and the current environment observation, then chooses a safe recovery action. Its goal is to make the game testable again so the Playtester Agent can retry or continue.
+
+The Recovery Agent does not determine whether a behavior is a real game bug, does not write the final report, and does not create a new test plan. It only attempts controlled recovery.
+
+#### Input:
+- state.RunContext.run_id
+- state.RunContext.game_url
+- state.RunContext.status
+- state.TestPlan
+- state.WorkingMemory.last_play_review
+- state.WorkingMemory.recovery_attempts
+- state.WorkingMemory.last_recovery_result
+- state.WorkingMemory.recovery_history
+- state.Artifacts.screenshots (before and after)
+
+#### Output:
+The Recovery Agent outputs a structured recovery_result:
+
+{
+  "recovery_id": "recovery_004",
+  "step": 4,
+  "trigger_failure_type": "input_not_received",
+  "trigger_likely_cause": "environment_or_focus_issue",
+  "recovery_action": {
+    "name": "click_canvas_center",
+    "params": {},
+    "reason": "The previous keyboard input may not have reached the canvas because the game was not focused."
+  },
+  "observation_before_recovery": {
+    "screenshot_path": "data/runs/run_001/screenshots/step_004_recovery_before.png",
+    "page_status": "active",
+    "canvas_detected": true,
+    "focused_element": "body",
+    "console_errors": []
+  },
+  "action_result": {
+    "ok": true,
+    "error": null
+  },
+  "observation_after_recovery": {
+    "screenshot_path": "data/runs/run_001/screenshots/step_004_recovery_after.png",
+    "page_status": "active",
+    "canvas_detected": true,
+    "focused_element": "canvas",
+    "console_errors": []
+  },
+  "recovery_status": "recovered",
+  "next_recommendation": "retry_last_goal",
+  "reason": "The canvas appears focused after clicking the center. The previous goal can be retried."
+}
+
+#### Recovery Guidelines
+
+The Recovery Agent should prefer low-risk recovery actions before high-risk actions.
+
+Recommended order:
+
+1. wait_for_loading
+2. click_canvas_center
+3. refocus_page
+4. press_escape
+5. close_modal_if_detected
+6. scroll_to_game_area
+7. reload_page
+8. no_safe_recovery
+
+The Recovery Agent should avoid destructive or state-resetting actions unless necessary.
+
+For example:
+
+reload_page
+
+should usually be used only when:
+
+- the page crashed
+- the game is frozen
+- the screen is black
+- loading timeout persists
+- lighter recovery actions failed
+
+#### Recovery Attempt Limit
+
+The Recovery Agent must respect a maximum recovery attempt limit.
+
+Example policy:
+
+MAX_RECOVERY_ATTEMPTS = 2
+
+If the limit is reached, the Recovery Agent should return:
+
+{
+  "recovery_status": "max_attempts_reached",
+  "next_recommendation": "report_now",
+  "reason": "Recovery was attempted multiple times but the environment did not return to a testable state."
+}
+
+The Supervisor should then decide whether to report, replan, or end.
+
+### Agent: Reporter Agent
+
+#### Responsibility
+The Reporter Agent is responsible for generating the final playtest report for a run.
+
+It reads the validated run data, trace events, play steps, critic reviews, recovery events, bug candidates, screenshots, and console summaries, then produces a structured report.
+
+The Reporter Agent does not play the game, does not verify new bugs, does not recover the environment, and does not modify the test plan. Its job is to summarize the evidence collected by previous agents into a clear, useful QA-style report.
+
+#### Input
+- state.RunContext.run_id
+- state.RunContext.game_url
+- state.RunContext.status
+- state.RunContext.total_steps
+- state.GameProfile
+- state.TestPlan
+- state.WorkingMemory.review_history
+- state.WorkingMemory.recovery_history
+- state.Artifacts
+
+#### Output
+The Reporter outputs a structured report_result:
+
+{
+  "report_id": "report_run_001",
+  "run_id": "run_001",
+  "report_title": "Playtest Report: Browser Game Run 001",
+  "summary": "The agent loaded the game, identified it as an unknown browser canvas game, tested basic interaction, and found one high-confidence blocking issue.",
+  "overall_status": "issues_found",
+  "tested_goals": [
+    {
+      "goal_id": "page_load",
+      "goal": "Verify that the game page loads",
+      "status": "passed",
+      "evidence": ["trace_001", "screenshots/step_001_after.png"]
+    },
+    {
+      "goal_id": "basic_interaction",
+      "goal": "Verify that the game responds to basic input",
+      "status": "failed",
+      "evidence": ["trace_003", "trace_004"]
+    }
+  ],
+  "bugs_found": [
+    {
+      "severity": "high",
+      "title": "Game turns black after clicking Start",
+      "description": "After clicking the Start area, the game screen became black and the console showed an uncaught runtime error.",
+      "evidence": [
+        "screenshots/step_006_before.png",
+        "screenshots/step_006_after.png",
+        "console_logs/step_006.json",
+        "trace_006"
+      ]
+    }
+  ],
+  "uncertain_observations": [
+    {
+      "title": "Keyboard input did not trigger movement",
+      "reason": "The canvas may not have been focused, so this was not treated as a confirmed game bug.",
+      "evidence": ["trace_003", "trace_004"]
+    }
+  ],
+  "recommendations": [
+    "Investigate the console error after the Start action.",
+    "Make canvas focus behavior clearer to players.",
+    "Add visible start or control instructions if possible."
+  ],
+  "report_markdown": "# Playtest Report\n..."
+}
+
+#### Report Guidelines
+
+The final Markdown report should include these sections:
+
+# Playtest Report
+
+## 1. Run Summary
+
+## 2. Game Profile
+
+## 3. Test Plan
+
+## 4. What the Agent Tried
+
+## 5. Results by Test Goal
+
+## 6. Bugs Found
+
+## 7. Uncertain Observations
+
+## 8. Recovery Attempts
+
+## 9. Evidence
+
+## 10. Recommendations
+
+The report should be useful to a game developer or product team.
+
+#### Evidence Rules
+
+The Reporter must ground every major claim in evidence.
+
+For each bug or issue, the report should include:
+
+- related step number
+- related test goal
+- action taken
+- expected result
+- actual result
+- critic review
+- screenshot paths
+- console error summary if available
+- trace IDs
+
+If evidence is weak, the Reporter should label the item as uncertain.
+
+Example:
+
+### Uncertain Observation: Keyboard input did not trigger movement
+
+The agent pressed ArrowRight, but no visible movement was detected. However, the Critic classified this as a possible focus issue rather than a confirmed game bug. The Recovery Agent attempted to refocus the canvas.
+
+Evidence:
+- trace_003
+- trace_004
+- screenshots/step_003_before.png
+- screenshots/step_003_after.png
+
+#### Input Context Prepared by Reporter Node
+
+The Reporter Agent should not receive only raw trace_ids.
+
+The Reporter Node should first prepare a report context:
+
+report_context = {
+    "run": state["run"],
+    "game": state["game"],
+    "plan": state["plan"],
+    "bug_candidates": state["working_memory"].get("bug_candidates", []),
+    "trace_events": trace_store.load_events(
+        state["artifacts"].get("trace_ids", [])
+    ),
+    "screenshot_paths": state["artifacts"].get("screenshots", []),
+    "stop_reason": state["run"].get("stop_reason"),
+}
+
+Then the Reporter Agent receives:
+
+reporter_agent.generate_report(report_context=report_context)
+
+This keeps the agent focused on writing the report rather than retrieving raw data.
+
+#### Failure Handling
+
+If the Reporter cannot generate a complete report because evidence is missing, it should generate a partial report instead of failing silently.
+
+Example:
+
+{
+  "report_id": "report_run_001",
+  "overall_status": "partial_report",
+  "summary": "The run ended before enough evidence was collected. This report summarizes the available trace events.",
+  "bugs_found": [],
+  "uncertain_observations": [
+    {
+      "title": "Insufficient evidence",
+      "reason": "The run ended before the Critic Agent produced a review."
+    }
+  ],
+  "recommendations": [
+    "Rerun the playtest with more steps.",
+    "Ensure screenshots and trace events are saved before report generation."
+  ],
+  "report_markdown": "# Partial Playtest Report\n..."
+}
